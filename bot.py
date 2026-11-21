@@ -110,9 +110,7 @@ def download_video(message):
         'noplaylist': True,
         'geo_bypass': True,
         'socket_timeout': 15,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        },
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
     }
 
     try:
@@ -148,7 +146,7 @@ def search_music(message):
         'extract_flat': True,
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 8,
+        'socket_timeout': 10,
     }
 
     try:
@@ -196,6 +194,25 @@ def search_music(message):
             wait_msg.message_id
         )
 
+def try_download_audio(target, base_name, player_clients=None):
+    opts = {
+        'format': 'bestaudio[filesize<45M]/bestaudio/best',
+        'outtmpl': f"{base_name}.%(ext)s",
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'geo_bypass': True,
+        'socket_timeout': 15,
+    }
+    if player_clients:
+        opts['extractor_args'] = {'youtube': {'player_client': player_clients}}
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=True)
+        if isinstance(info, dict) and 'entries' in info and info['entries']:
+            info = info['entries'][0]
+        return info
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("dl:"))
 def download_audio_callback(call):
     if not is_subscribed(call.from_user.id):
@@ -211,33 +228,38 @@ def download_audio_callback(call):
 
     vid_id = track["id"]
     title = track["title"]
-    url = f"https://www.youtube.com/watch?v={vid_id}"
+    yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
     bot.answer_callback_query(call.id, "⏳ Yuklanmoqda...")
     wait_msg = bot.send_message(call.message.chat.id, "⏳ Qo'shiq yuklanmoqda, biroz kuting...")
 
     base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{vid_id}"
-    ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[filesize<45M]/bestaudio/best',
-        'outtmpl': f"{base_name}.%(ext)s",
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'socket_timeout': 15,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        },
-    }
+    downloaded_info = None
+
+    attempts = [
+        (yt_url, ['android', 'ios']),
+        (yt_url, ['web_safari', 'mweb']),
+        (f"scsearch1:{title}", None),
+    ]
+
+    for target, clients in attempts:
+        for f in glob.glob(f"{base_name}.*"):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+        try:
+            downloaded_info = try_download_audio(target, base_name, clients)
+            if glob.glob(f"{base_name}.*"):
+                break
+        except Exception:
+            downloaded_info = None
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            performer = info.get('uploader', 'TezMedia') if info else 'TezMedia'
-
-        downloaded_files = glob.glob(f"{base_name}.*")
-        if downloaded_files:
-            audio_path = downloaded_files[0]
+        files = glob.glob(f"{base_name}.*")
+        if files:
+            audio_path = files[0]
+            performer = (downloaded_info.get('uploader') if isinstance(downloaded_info, dict) else None) or "TezMedia"
             with open(audio_path, 'rb') as audio:
                 bot.send_audio(
                     call.message.chat.id,
@@ -248,9 +270,17 @@ def download_audio_callback(call):
                 )
             bot.delete_message(call.message.chat.id, wait_msg.message_id)
         else:
-            bot.edit_message_text("❌ Qo'shiqni yuklab bo'lmadi.", call.message.chat.id, wait_msg.message_id)
+            bot.edit_message_text(
+                "❌ Hozir bu qo'shiqni yuklab bo'lmadi. Ro'yxatdan boshqa raqamni bosib ko'ring.",
+                call.message.chat.id,
+                wait_msg.message_id
+            )
     except Exception:
-        bot.edit_message_text("❌ Qo'shiqni yuklab bo'lmadi.", call.message.chat.id, wait_msg.message_id)
+        bot.edit_message_text(
+            "❌ Qo'shiqni yuborishda xatolik yuz berdi.",
+            call.message.chat.id,
+            wait_msg.message_id
+        )
     finally:
         for f in glob.glob(f"{base_name}.*"):
             try:
