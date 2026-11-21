@@ -17,6 +17,8 @@ if RAW_CHANNEL and not RAW_CHANNEL.startswith("@") and not RAW_CHANNEL.startswit
 else:
     CHANNEL_ID = RAW_CHANNEL
 
+COOKIE_FILE = "cookies.txt" if os.path.exists("cookies.txt") else None
+
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=6)
 TRACK_ITEMS = {}
 
@@ -80,7 +82,6 @@ def search_tracks_fast(query):
     found = []
     q_enc = urllib.parse.quote(query)
 
-    # 1. Deezer
     try:
         data = fetch_json(f"https://api.deezer.com/search?q={q_enc}&limit=10")
         for item in data.get("data", []):
@@ -93,7 +94,6 @@ def search_tracks_fast(query):
     except Exception:
         pass
 
-    # 2. iTunes qo'shimcha natijalar
     try:
         data = fetch_json(f"https://itunes.apple.com/search?term={q_enc}&media=music&limit=10")
         seen = {x["full"].lower() for x in found}
@@ -111,6 +111,25 @@ def search_tracks_fast(query):
         pass
 
     return found[:10]
+
+def build_ydl_opts(outtmpl, is_audio=True, clients=None):
+    opts = {
+        'format': 'bestaudio[filesize<45M]/bestaudio/best' if is_audio else 'best[ext=mp4][filesize<50M]/best[ext=mp4]/best',
+        'outtmpl': outtmpl,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'geo_bypass': True,
+        'socket_timeout': 20,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        },
+    }
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+        opts['cookiefile'] = COOKIE_FILE
+    if clients:
+        opts['extractor_args'] = {'youtube': {'player_client': clients}}
+    return opts
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def check_sub_callback(call):
@@ -149,18 +168,8 @@ def download_video(message):
     wait_msg = bot.reply_to(message, "⏳ Video yuklanmoqda, biroz kuting...")
     filename = f"video_{message.chat.id}_{message.message_id}.mp4"
 
-    ydl_opts = {
-        'format': 'best[ext=mp4][filesize<50M]/best[ext=mp4]/best',
-        'outtmpl': filename,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'socket_timeout': 15,
-        'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'android', 'web']}},
-    }
-
     try:
+        ydl_opts = build_ydl_opts(filename, is_audio=False, clients=['web', 'android', 'ios'])
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -227,9 +236,9 @@ def download_audio_callback(call):
     sent = False
 
     candidates = [
+        (f"ytsearch1:{tr['full']} audio", ['web', 'mweb']),
+        (f"ytsearch1:{tr['full']}", ['android', 'ios']),
         (f"scsearch1:{tr['full']}", None),
-        (f"ytsearch1:{tr['full']} audio", ['tv_embedded', 'android']),
-        (f"ytsearch1:{tr['full']}", ['ios', 'mweb']),
     ]
 
     for target, clients in candidates:
@@ -239,18 +248,7 @@ def download_audio_callback(call):
             except Exception:
                 pass
         try:
-            opts = {
-                'format': 'bestaudio[filesize<45M]/bestaudio/best',
-                'outtmpl': f"{base_name}.%(ext)s",
-                'quiet': True,
-                'no_warnings': True,
-                'noplaylist': True,
-                'geo_bypass': True,
-                'socket_timeout': 15,
-            }
-            if clients:
-                opts['extractor_args'] = {'youtube': {'player_client': clients}}
-
+            opts = build_ydl_opts(f"{base_name}.%(ext)s", is_audio=True, clients=clients)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([target])
 
