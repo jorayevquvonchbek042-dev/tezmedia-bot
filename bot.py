@@ -196,30 +196,32 @@ def search_music(message):
         )
 
 def download_from_jamendo(query, out_mp3):
-    try:
-        r = requests.get(
-            "https://api.jamendo.com/v3.0/tracks/",
-            params={
-                "client_id": "56d30c95",
-                "format": "json",
-                "limit": 3,
-                "search": query,
-                "audioformat": "mp31",
-            },
-            timeout=10,
-        )
-        if r.status_code == 200:
-            tracks = r.json().get("results", [])
-            for tr in tracks:
-                audio_url = tr.get("audio")
-                if audio_url:
-                    resp = requests.get(audio_url, timeout=25)
-                    if resp.status_code == 200 and len(resp.content) > 50000:
-                        with open(out_mp3, "wb") as f:
-                            f.write(resp.content)
-                        return tr.get("artist_name") or "TezMedia", tr.get("name") or query
-    except Exception:
-        pass
+    clean_q = re.sub(r'\(.*?\)|\[.*?\]|\|.*', '', query).strip() or query
+    for term in (query, clean_q):
+        try:
+            r = requests.get(
+                "https://api.jamendo.com/v3.0/tracks/",
+                params={
+                    "client_id": "56d30c95",
+                    "format": "json",
+                    "limit": 3,
+                    "search": term,
+                    "audioformat": "mp31",
+                },
+                timeout=10,
+            )
+            if r.status_code == 200:
+                tracks = r.json().get("results", [])
+                for tr in tracks:
+                    audio_url = tr.get("audio")
+                    if audio_url:
+                        resp = requests.get(audio_url, timeout=25)
+                        if resp.status_code == 200 and len(resp.content) > 50000:
+                            with open(out_mp3, "wb") as f:
+                                f.write(resp.content)
+                            return tr.get("artist_name") or "TezMedia", tr.get("name") or query
+        except Exception:
+            pass
     return None, None
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("dl:"))
@@ -239,16 +241,16 @@ def download_audio_callback(call):
     title = track["title"]
     yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-    bot.answer_callback_query(call.id, "⏳ Yuklanmoqda...")
-    wait_msg = bot.send_message(call.message.chat.id, "⏳ Qo'shiq yuklanmoqda, biroz kuting...")
+    bot.answer_callback_query(call.id, "⏳ Audio tayyorlanmoqda...")
+    wait_msg = bot.send_message(call.message.chat.id, "⏳ Audio fayl yuklanmoqda, biroz kuting...")
 
     base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{vid_id}"
     jamendo_mp3 = f"{base_name}_jam.mp3"
     performer = "TezMedia"
     sent = False
 
-    # 1-urinish: yt_dlp orqali audio yuklash
-    for clients in (['tv_embedded', 'android'], ['ios', 'mweb']):
+    # 1-urinish: yt_dlp orqali audio fayl olish
+    for clients in (['tv_embedded', 'android'], ['ios', 'mweb'], ['web']):
         for f in glob.glob(f"{base_name}.*"):
             try:
                 os.remove(f)
@@ -285,7 +287,7 @@ def download_audio_callback(call):
         except Exception:
             pass
 
-    # 2-urinish: Render bloklagan holatlarda ochiq audio bazasidan MP3 yuklash
+    # 2-urinish: ochiq MP3 katalogidan fayl yuborish
     if not sent:
         j_artist, j_title = download_from_jamendo(title, jamendo_mp3)
         if os.path.exists(jamendo_mp3):
@@ -304,14 +306,10 @@ def download_audio_callback(call):
                 pass
 
     if not sent:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("▶️ YouTube'da ochish", url=yt_url))
         bot.edit_message_text(
-            f"❌ Server YouTube'dan faylni yuklashga ruxsat bermadi.\n\n🎵 <b>{title}</b>\nQuyidagi tugma orqali to'g'ridan-to'g'ri ochib tinglashingiz mumkin:",
+            "❌ Afsuski, Render serveri bu qo'shiq uchun audio faylni yuklab bera olmadi. Ro'yxatdan boshqa raqamni bosib ko'ring.",
             call.message.chat.id,
-            wait_msg.message_id,
-            parse_mode="HTML",
-            reply_markup=markup
+            wait_msg.message_id
         )
 
     for f in glob.glob(f"{base_name}*"):
