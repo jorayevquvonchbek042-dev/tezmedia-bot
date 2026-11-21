@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import json
+import base64
 import urllib.parse
 import urllib.request
 import threading
@@ -16,6 +17,27 @@ if RAW_CHANNEL and not RAW_CHANNEL.startswith("@") and not RAW_CHANNEL.startswit
     CHANNEL_ID = f"@{RAW_CHANNEL}"
 else:
     CHANNEL_ID = RAW_CHANNEL
+
+COOKIES_RAW = os.environ.get("YT_COOKIES", "").strip()
+COOKIES_PATH = "/tmp/yt_cookies.txt"
+
+def prepare_cookies_file():
+    if not COOKIES_RAW or COOKIES_RAW.lower() == "cookies.txt":
+        return None
+    try:
+        if "# Netscape HTTP Cookie File" in COOKIES_RAW or "\t" in COOKIES_RAW:
+            content = COOKIES_RAW
+        else:
+            content = base64.b64decode(COOKIES_RAW).decode("utf-8", errors="ignore")
+        if len(content.strip()) < 20:
+            return None
+        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        return COOKIES_PATH
+    except Exception:
+        return None
+
+ACTIVE_COOKIE_FILE = prepare_cookies_file()
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=6)
 TRACK_ITEMS = {}
@@ -159,38 +181,59 @@ def download_video(message):
 
     url = extract_url(message.text)
     wait_msg = bot.reply_to(message, "⏳ Video yuklanmoqda, biroz kuting...")
-    filename = f"video_{message.chat.id}_{message.message_id}.mp4"
+    base_vid = f"video_{message.chat.id}_{message.message_id}"
+    filename = f"{base_vid}.mp4"
+    sent = False
 
-    ydl_opts = {
-        'format': 'best[ext=mp4][filesize<50M]/best[ext=mp4]/best',
-        'outtmpl': filename,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'socket_timeout': 20,
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
-    }
+    for clients in [['web', 'mweb', 'android'], ['ios', 'web']]:
+        for f in glob.glob(f"{base_vid}*"):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        ydl_opts = {
+            'format': 'best[ext=mp4][filesize<50M]/best[ext=mp4]/best',
+            'outtmpl': filename,
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'geo_bypass': True,
+            'socket_timeout': 20,
+            'extractor_args': {'youtube': {'player_client': clients}},
+        }
+        if ACTIVE_COOKIE_FILE:
+            ydl_opts['cookiefile'] = ACTIVE_COOKIE_FILE
 
-        if os.path.exists(filename):
-            with open(filename, 'rb') as video:
-                bot.send_video(message.chat.id, video, caption="📥 @tezmedia_uz_bot orqali yuklandi")
-            bot.delete_message(message.chat.id, wait_msg.message_id)
-        else:
-            bot.edit_message_text("❌ Videoni yuklab bo'lmadi.", message.chat.id, wait_msg.message_id)
-    except Exception:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            ready_files = [
+                f for f in glob.glob(f"{base_vid}*")
+                if not f.endswith((".part", ".ytdl", ".temp"))
+            ]
+            if ready_files:
+                with open(ready_files[0], 'rb') as video:
+                    bot.send_video(message.chat.id, video, caption="📥 @tezmedia_uz_bot orqali yuklandi")
+                bot.delete_message(message.chat.id, wait_msg.message_id)
+                sent = True
+                break
+        except Exception:
+            pass
+
+    if not sent:
         bot.edit_message_text(
-            "❌ Videoni yuklab bo'lmadi. Havola ochiq ekanligini tekshiring.",
+            "❌ Videoni yuklab bo'lmadi. Havola ochiq ekanligini tekshiring yoki keyinroq urinib ko'ring.",
             message.chat.id,
             wait_msg.message_id
         )
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
+
+    for f in glob.glob(f"{base_vid}*"):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
 
 @bot.message_handler(func=lambda m: m.text and not m.text.startswith('/') and extract_url(m.text) is None)
 def search_music(message):
@@ -232,8 +275,8 @@ def download_audio_callback(call):
         bot.answer_callback_query(call.id, "⚠️ Ro'yxat eskirgan, qayta qidiring.", show_alert=True)
         return
 
-    bot.answer_callback_query(call.id, "⏳ To'liq audio izlanmoqda...")
-    wait_msg = bot.send_message(call.message.chat.id, f"⏳ «{tr['full']}» to'liq audio qilib yuklanmoqda...")
+    bot.answer_callback_query(call.id, "⏳ Audio tayyorlanmoqda...")
+    wait_msg = bot.send_message(call.message.chat.id, f"⏳ «{tr['full']}» yuklanmoqda...")
 
     base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{key.replace(':', '_')}"
     sent = False
@@ -268,6 +311,8 @@ def download_audio_callback(call):
             }
             if clients:
                 opts['extractor_args'] = {'youtube': {'player_client': clients}}
+            if ACTIVE_COOKIE_FILE:
+                opts['cookiefile'] = ACTIVE_COOKIE_FILE
 
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([target])
@@ -336,3 +381,4 @@ def download_audio_callback(call):
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     bot.infinity_polling(timeout=20, long_polling_timeout=15)
+       
