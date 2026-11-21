@@ -3,6 +3,7 @@ import re
 import glob
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import requests
 import telebot
 from telebot import types
 import yt_dlp
@@ -58,7 +59,7 @@ def send_sub_prompt(chat_id):
         reply_markup=markup
     )
 
-def format_duration(seconds):
+def format_sec(seconds):
     if not seconds:
         return ""
     seconds = int(seconds)
@@ -110,7 +111,7 @@ def download_video(message):
         'noplaylist': True,
         'geo_bypass': True,
         'socket_timeout': 15,
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
+        'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'android', 'web']}},
     }
 
     try:
@@ -163,7 +164,7 @@ def search_music(message):
             title = (item.get('title') or '').strip()
             if vid_id and title:
                 idx += 1
-                dur = format_duration(item.get('duration'))
+                dur = format_sec(item.get('duration'))
                 clean_title = title.replace("<", "").replace(">", "")
                 lines.append(f"{idx}. {clean_title}{dur}")
 
@@ -194,24 +195,32 @@ def search_music(message):
             wait_msg.message_id
         )
 
-def try_download_audio(target, base_name, player_clients=None):
-    opts = {
-        'format': 'bestaudio[filesize<45M]/bestaudio/best',
-        'outtmpl': f"{base_name}.%(ext)s",
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'socket_timeout': 15,
-    }
-    if player_clients:
-        opts['extractor_args'] = {'youtube': {'player_client': player_clients}}
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(target, download=True)
-        if isinstance(info, dict) and 'entries' in info and info['entries']:
-            info = info['entries'][0]
-        return info
+def download_from_jamendo(query, out_mp3):
+    try:
+        r = requests.get(
+            "https://api.jamendo.com/v3.0/tracks/",
+            params={
+                "client_id": "56d30c95",
+                "format": "json",
+                "limit": 3,
+                "search": query,
+                "audioformat": "mp31",
+            },
+            timeout=10,
+        )
+        if r.status_code == 200:
+            tracks = r.json().get("results", [])
+            for tr in tracks:
+                audio_url = tr.get("audio")
+                if audio_url:
+                    resp = requests.get(audio_url, timeout=25)
+                    if resp.status_code == 200 and len(resp.content) > 50000:
+                        with open(out_mp3, "wb") as f:
+                            f.write(resp.content)
+                        return tr.get("artist_name") or "TezMedia", tr.get("name") or query
+    except Exception:
+        pass
+    return None, None
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("dl:"))
 def download_audio_callback(call):
@@ -234,59 +243,82 @@ def download_audio_callback(call):
     wait_msg = bot.send_message(call.message.chat.id, "⏳ Qo'shiq yuklanmoqda, biroz kuting...")
 
     base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{vid_id}"
-    downloaded_info = None
+    jamendo_mp3 = f"{base_name}_jam.mp3"
+    performer = "TezMedia"
+    sent = False
 
-    attempts = [
-        (yt_url, ['android', 'ios']),
-        (yt_url, ['web_safari', 'mweb']),
-        (f"scsearch1:{title}", None),
-    ]
-
-    for target, clients in attempts:
+    # 1-urinish: yt_dlp orqali audio yuklash
+    for clients in (['tv_embedded', 'android'], ['ios', 'mweb']):
         for f in glob.glob(f"{base_name}.*"):
             try:
                 os.remove(f)
             except Exception:
                 pass
         try:
-            downloaded_info = try_download_audio(target, base_name, clients)
-            if glob.glob(f"{base_name}.*"):
+            opts = {
+                'format': 'bestaudio[filesize<45M]/bestaudio/best',
+                'outtmpl': f"{base_name}.%(ext)s",
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'geo_bypass': True,
+                'socket_timeout': 15,
+                'extractor_args': {'youtube': {'player_client': clients}},
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(yt_url, download=True)
+                if isinstance(info, dict) and info.get('uploader'):
+                    performer = info['uploader']
+            files = glob.glob(f"{base_name}.*")
+            if files:
+                with open(files[0], 'rb') as audio:
+                    bot.send_audio(
+                        call.message.chat.id,
+                        audio,
+                        title=title,
+                        performer=performer,
+                        caption="🎵 @tezmedia_uz_bot orqali yuklandi"
+                    )
+                bot.delete_message(call.message.chat.id, wait_msg.message_id)
+                sent = True
                 break
         except Exception:
-            downloaded_info = None
+            pass
 
-    try:
-        files = glob.glob(f"{base_name}.*")
-        if files:
-            audio_path = files[0]
-            performer = (downloaded_info.get('uploader') if isinstance(downloaded_info, dict) else None) or "TezMedia"
-            with open(audio_path, 'rb') as audio:
-                bot.send_audio(
-                    call.message.chat.id,
-                    audio,
-                    title=title,
-                    performer=performer,
-                    caption="🎵 @tezmedia_uz_bot orqali yuklandi"
-                )
-            bot.delete_message(call.message.chat.id, wait_msg.message_id)
-        else:
-            bot.edit_message_text(
-                "❌ Hozir bu qo'shiqni yuklab bo'lmadi. Ro'yxatdan boshqa raqamni bosib ko'ring.",
-                call.message.chat.id,
-                wait_msg.message_id
-            )
-    except Exception:
-        bot.edit_message_text(
-            "❌ Qo'shiqni yuborishda xatolik yuz berdi.",
-            call.message.chat.id,
-            wait_msg.message_id
-        )
-    finally:
-        for f in glob.glob(f"{base_name}.*"):
+    # 2-urinish: Render bloklagan holatlarda ochiq audio bazasidan MP3 yuklash
+    if not sent:
+        j_artist, j_title = download_from_jamendo(title, jamendo_mp3)
+        if os.path.exists(jamendo_mp3):
             try:
-                os.remove(f)
+                with open(jamendo_mp3, 'rb') as audio:
+                    bot.send_audio(
+                        call.message.chat.id,
+                        audio,
+                        title=j_title or title,
+                        performer=j_artist or "TezMedia",
+                        caption="🎵 @tezmedia_uz_bot orqali yuklandi"
+                    )
+                bot.delete_message(call.message.chat.id, wait_msg.message_id)
+                sent = True
             except Exception:
                 pass
+
+    if not sent:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("▶️ YouTube'da ochish", url=yt_url))
+        bot.edit_message_text(
+            f"❌ Server YouTube'dan faylni yuklashga ruxsat bermadi.\n\n🎵 <b>{title}</b>\nQuyidagi tugma orqali to'g'ridan-to'g'ri ochib tinglashingiz mumkin:",
+            call.message.chat.id,
+            wait_msg.message_id,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+
+    for f in glob.glob(f"{base_name}*"):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
