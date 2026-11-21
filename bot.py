@@ -1,10 +1,8 @@
 import os
 import re
 import glob
-import urllib.parse
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
 import telebot
 from telebot import types
 import yt_dlp
@@ -17,7 +15,7 @@ else:
     CHANNEL_ID = RAW_CHANNEL
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=4)
-SEARCH_CACHE = {}
+TRACK_TITLES = {}
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -60,61 +58,12 @@ def send_sub_prompt(chat_id):
         reply_markup=markup
     )
 
-def format_duration(ms):
-    if not ms:
+def format_duration(seconds):
+    if not seconds:
         return ""
-    seconds = int(ms // 1000)
+    seconds = int(seconds)
     mins, secs = divmod(seconds, 60)
     return f" ({mins}:{secs:02d})"
-
-def fast_music_search(query):
-    results = []
-    # 1-tezkor manba: Deezer API (0.3 soniyada ijrochi va qo'shiq nomini qaytaradi)
-    try:
-        r = requests.get(
-            "https://api.deezer.com/search",
-            params={"q": query, "limit": 6},
-            timeout=5
-        )
-        if r.status_code == 200:
-            for item in r.json().get("data", []):
-                artist = item.get("artist", {}).get("name", "")
-                title = item.get("title", "")
-                dur = format_duration(item.get("duration", 0) * 1000)
-                if artist and title:
-                    results.append({
-                        "label": f"{artist} — {title}",
-                        "dur": dur,
-                        "artist": artist,
-                        "title": title
-                    })
-    except Exception:
-        pass
-
-    # 2-tezkor zaxira manba: iTunes API
-    if not results:
-        try:
-            r = requests.get(
-                "https://itunes.apple.com/search",
-                params={"term": query, "media": "music", "limit": 6},
-                timeout=5
-            )
-            if r.status_code == 200:
-                for item in r.json().get("results", []):
-                    artist = item.get("artistName", "")
-                    title = item.get("trackName", "")
-                    dur = format_duration(item.get("trackTimeMillis", 0))
-                    if artist and title:
-                        results.append({
-                            "label": f"{artist} — {title}",
-                            "dur": dur,
-                            "artist": artist,
-                            "title": title
-                        })
-        except Exception:
-            pass
-
-    return results[:5]
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def check_sub_callback(call):
@@ -192,47 +141,65 @@ def search_music(message):
         return
 
     query = message.text.strip()
-    results = fast_music_search(query)
+    wait_msg = bot.reply_to(message, f"🔍 «{query}» qidirilmoqda...")
 
-    # Agar katalogda topilmasa, to'g'ridan-to'g'ri SoundCloud/YouTube orqali qidirish tugmasini beradi
-    if not results:
-        results = [{"label": query, "dur": "", "artist": "", "title": query}]
+    ydl_opts = {
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+    }
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for idx, item in enumerate(results, 1):
-        cache_key = f"{message.chat.id}_{message.message_id}_{idx}"
-        SEARCH_CACHE[cache_key] = item
-        if len(SEARCH_CACHE) > 500:
-            SEARCH_CACHE.pop(next(iter(SEARCH_CACHE)))
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            entries = info.get('entries', []) if info else []
 
-        short_label = item["label"][:42] + "..." if len(item["label"]) > 42 else item["label"]
-        btn_text = f"🎵 {idx}. {short_label}{item['dur']}"
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"trk:{cache_key}"))
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        count = 0
+        for item in entries:
+            vid_id = item.get('id')
+            title = item.get('title') or 'Nomsiz qo\'shiq'
+            duration = format_duration(item.get('duration'))
+            if vid_id:
+                count += 1
+                TRACK_TITLES[vid_id] = title
+                if len(TRACK_TITLES) > 1000:
+                    TRACK_TITLES.pop(next(iter(TRACK_TITLES)))
 
-    bot.reply_to(
-        message,
-        f"🎶 «{query}» bo'yicha natijalar (keraklisini tanlang):",
-        reply_markup=markup
-    )
+                short_title = title[:42] + "..." if len(title) > 42 else title
+                btn_text = f"🎵 {count}. {short_title}{duration}"
+                markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"aud:{vid_id}"))
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("trk:"))
-def download_track_callback(call):
+        if count == 0:
+            bot.edit_message_text("❌ Hech qanday qo'shiq topilmadi.", message.chat.id, wait_msg.message_id)
+            return
+
+        bot.edit_message_text(
+            f"🎶 «{query}» bo'yicha topilgan qo'shiqlar:",
+            message.chat.id,
+            wait_msg.message_id,
+            reply_markup=markup
+        )
+    except Exception:
+        bot.edit_message_text(
+            "❌ Hozir qidiruvda cheklov bor. Bir ozdan so'ng qayta urinib ko'ring.",
+            message.chat.id,
+            wait_msg.message_id
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("aud:"))
+def download_audio_callback(call):
     if not is_subscribed(call.from_user.id):
         bot.answer_callback_query(call.id, "⚠️ Avval kanalga obuna bo'ling!", show_alert=True)
         send_sub_prompt(call.message.chat.id)
         return
 
-    cache_key = call.data.split("trk:", 1)[1]
-    item = SEARCH_CACHE.get(cache_key)
-    if not item:
-        bot.answer_callback_query(call.id, "⚠️ Eskirgan tugma, qo'shiq nomini qayta yozing.", show_alert=True)
-        return
+    vid_id = call.data.split("aud:", 1)[1]
+    url = f"https://www.youtube.com/watch?v={vid_id}"
+    bot.answer_callback_query(call.id, "⏳ Qo'shiq yuklanmoqda...")
+    wait_msg = bot.send_message(call.message.chat.id, "⏳ Qo'shiq yuklanmoqda, biroz kuting...")
 
-    search_term = item["label"]
-    bot.answer_callback_query(call.id, "⏳ Yuklanmoqda...")
-    wait_msg = bot.send_message(call.message.chat.id, f"⏳ «{search_term}» yuklanmoqda...")
-
-    base_name = f"audio_{call.message.chat.id}_{call.message.message_id}"
+    base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{vid_id}"
     ydl_opts = {
         'format': 'bestaudio[ext=m4a]/bestaudio[filesize<45M]/bestaudio/best',
         'outtmpl': f"{base_name}.%(ext)s",
@@ -245,48 +212,34 @@ def download_track_callback(call):
         },
     }
 
-    success = False
-    for source_prefix in (f"scsearch1:{search_term}", f"ytsearch1:{search_term} audio"):
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(source_prefix, download=True)
-                entry = info['entries'][0] if info and 'entries' in info and info['entries'] else info
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = TRACK_TITLES.get(vid_id) or (info.get('title') if info else 'Audio')
+            performer = info.get('uploader', 'TezMedia') if info else 'TezMedia'
 
-            downloaded_files = glob.glob(f"{base_name}.*")
-            if downloaded_files:
-                audio_path = downloaded_files[0]
-                title = item["title"] or (entry.get('title') if entry else search_term)
-                performer = item["artist"] or (entry.get('uploader') if entry else "TezMedia")
-                with open(audio_path, 'rb') as audio:
-                    bot.send_audio(
-                        call.message.chat.id,
-                        audio,
-                        title=title,
-                        performer=performer,
-                        caption="🎵 @tezmedia_uz_bot orqali yuklandi"
-                    )
-                bot.delete_message(call.message.chat.id, wait_msg.message_id)
-                success = True
-                break
-        except Exception:
-            for f in glob.glob(f"{base_name}.*"):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-
-    if not success:
-        bot.edit_message_text(
-            "❌ Qo'shiqni yuklab bo'lmadi. Boshqa variantni tanlab ko'ring.",
-            call.message.chat.id,
-            wait_msg.message_id
-        )
-
-    for f in glob.glob(f"{base_name}.*"):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
+        downloaded_files = glob.glob(f"{base_name}.*")
+        if downloaded_files:
+            audio_path = downloaded_files[0]
+            with open(audio_path, 'rb') as audio:
+                bot.send_audio(
+                    call.message.chat.id,
+                    audio,
+                    title=title,
+                    performer=performer,
+                    caption="🎵 @tezmedia_uz_bot orqali yuklandi"
+                )
+            bot.delete_message(call.message.chat.id, wait_msg.message_id)
+        else:
+            bot.edit_message_text("❌ Qo'shiqni yuklab bo'lmadi.", call.message.chat.id, wait_msg.message_id)
+    except Exception:
+        bot.edit_message_text("❌ Qo'shiqni yuklab bo'lmadi.", call.message.chat.id, wait_msg.message_id)
+    finally:
+        for f in glob.glob(f"{base_name}.*"):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
