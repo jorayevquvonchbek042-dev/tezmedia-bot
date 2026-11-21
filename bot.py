@@ -1,9 +1,11 @@
 import os
 import re
 import glob
+import json
+import urllib.parse
+import urllib.request
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
 import telebot
 from telebot import types
 import yt_dlp
@@ -59,12 +61,56 @@ def send_sub_prompt(chat_id):
         reply_markup=markup
     )
 
-def format_sec(seconds):
-    if not seconds:
+def fmt_sec(sec):
+    if not sec:
         return ""
-    seconds = int(seconds)
-    mins, secs = divmod(seconds, 60)
-    return f" {mins}:{secs:02d}"
+    sec = int(sec)
+    m, s = divmod(sec, 60)
+    return f" {m}:{s:02d}"
+
+def fetch_json(url, timeout=8):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+def search_tracks_fast(query):
+    found = []
+    q_enc = urllib.parse.quote(query)
+
+    # 1. Deezer
+    try:
+        data = fetch_json(f"https://api.deezer.com/search?q={q_enc}&limit=10")
+        for item in data.get("data", []):
+            artist = (item.get("artist") or {}).get("name", "").strip()
+            title = (item.get("title") or "").strip()
+            dur = fmt_sec(item.get("duration"))
+            if title:
+                full = f"{artist} - {title}" if artist else title
+                found.append({"artist": artist or "TezMedia", "title": title, "full": full, "dur": dur})
+    except Exception:
+        pass
+
+    # 2. iTunes qo'shimcha natijalar
+    try:
+        data = fetch_json(f"https://itunes.apple.com/search?term={q_enc}&media=music&limit=10")
+        seen = {x["full"].lower() for x in found}
+        for item in data.get("results", []):
+            artist = (item.get("artistName") or "").strip()
+            title = (item.get("trackName") or "").strip()
+            dur_ms = item.get("trackTimeMillis")
+            dur = fmt_sec(dur_ms // 1000) if dur_ms else ""
+            if title:
+                full = f"{artist} - {title}" if artist else title
+                if full.lower() not in seen:
+                    seen.add(full.lower())
+                    found.append({"artist": artist or "TezMedia", "title": title, "full": full, "dur": dur})
+    except Exception:
+        pass
+
+    return found[:10]
 
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def check_sub_callback(call):
@@ -141,88 +187,25 @@ def search_music(message):
         return
 
     query = message.text.strip()
-    wait_msg = bot.reply_to(message, f"🔎 {query}")
+    tracks = search_tracks_fast(query)
+    if not tracks:
+        tracks = [{"artist": "TezMedia", "title": query, "full": query, "dur": ""}]
 
-    ydl_opts = {
-        'extract_flat': True,
-        'quiet': True,
-        'no_warnings': True,
-        'socket_timeout': 10,
-    }
+    lines = [f"🔎 {query}\n"]
+    buttons = []
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch10:{query}", download=False)
-            entries = info.get('entries', []) if info else []
+    for idx, tr in enumerate(tracks, 1):
+        lines.append(f"{idx}. {tr['full']}{tr['dur']}")
+        key = f"{message.chat.id}_{message.message_id}_{idx}"
+        TRACK_ITEMS[key] = tr
+        if len(TRACK_ITEMS) > 1500:
+            TRACK_ITEMS.pop(next(iter(TRACK_ITEMS)))
+        buttons.append(types.InlineKeyboardButton(str(idx), callback_data=f"dl:{key}"))
 
-        lines = [f"🔎 {query}\n"]
-        buttons = []
-        idx = 0
+    markup = types.InlineKeyboardMarkup(row_width=5)
+    markup.add(*buttons)
 
-        for item in entries:
-            vid_id = item.get('id')
-            title = (item.get('title') or '').strip()
-            if vid_id and title:
-                idx += 1
-                dur = format_sec(item.get('duration'))
-                clean_title = title.replace("<", "").replace(">", "")
-                lines.append(f"{idx}. {clean_title}{dur}")
-
-                key = f"{message.chat.id}_{message.message_id}_{idx}"
-                TRACK_ITEMS[key] = {"id": vid_id, "title": clean_title}
-                if len(TRACK_ITEMS) > 1500:
-                    TRACK_ITEMS.pop(next(iter(TRACK_ITEMS)))
-
-                buttons.append(types.InlineKeyboardButton(str(idx), callback_data=f"dl:{key}"))
-
-        if idx == 0:
-            bot.edit_message_text("❌ Hech qanday qo'shiq topilmadi.", message.chat.id, wait_msg.message_id)
-            return
-
-        markup = types.InlineKeyboardMarkup(row_width=5)
-        markup.add(*buttons)
-
-        bot.edit_message_text(
-            "\n".join(lines),
-            message.chat.id,
-            wait_msg.message_id,
-            reply_markup=markup
-        )
-    except Exception:
-        bot.edit_message_text(
-            "❌ Qidiruvda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring.",
-            message.chat.id,
-            wait_msg.message_id
-        )
-
-def download_from_jamendo(query, out_mp3):
-    clean_q = re.sub(r'\(.*?\)|\[.*?\]|\|.*', '', query).strip() or query
-    for term in (query, clean_q):
-        try:
-            r = requests.get(
-                "https://api.jamendo.com/v3.0/tracks/",
-                params={
-                    "client_id": "56d30c95",
-                    "format": "json",
-                    "limit": 3,
-                    "search": term,
-                    "audioformat": "mp31",
-                },
-                timeout=10,
-            )
-            if r.status_code == 200:
-                tracks = r.json().get("results", [])
-                for tr in tracks:
-                    audio_url = tr.get("audio")
-                    if audio_url:
-                        resp = requests.get(audio_url, timeout=25)
-                        if resp.status_code == 200 and len(resp.content) > 50000:
-                            with open(out_mp3, "wb") as f:
-                                f.write(resp.content)
-                            return tr.get("artist_name") or "TezMedia", tr.get("name") or query
-        except Exception:
-            pass
-    return None, None
+    bot.reply_to(message, "\n".join(lines), reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("dl:"))
 def download_audio_callback(call):
@@ -232,25 +215,24 @@ def download_audio_callback(call):
         return
 
     key = call.data.split("dl:", 1)[1]
-    track = TRACK_ITEMS.get(key)
-    if not track:
+    tr = TRACK_ITEMS.get(key)
+    if not tr:
         bot.answer_callback_query(call.id, "⚠️ Ro'yxat eskirgan, qayta qidiring.", show_alert=True)
         return
 
-    vid_id = track["id"]
-    title = track["title"]
-    yt_url = f"https://www.youtube.com/watch?v={vid_id}"
+    bot.answer_callback_query(call.id, "⏳ Audio yuklanmoqda...")
+    wait_msg = bot.send_message(call.message.chat.id, f"⏳ «{tr['full']}» yuklanmoqda...")
 
-    bot.answer_callback_query(call.id, "⏳ Audio tayyorlanmoqda...")
-    wait_msg = bot.send_message(call.message.chat.id, "⏳ Audio fayl yuklanmoqda, biroz kuting...")
-
-    base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{vid_id}"
-    jamendo_mp3 = f"{base_name}_jam.mp3"
-    performer = "TezMedia"
+    base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{key.replace(':', '_')}"
     sent = False
 
-    # 1-urinish: yt_dlp orqali audio fayl olish
-    for clients in (['tv_embedded', 'android'], ['ios', 'mweb'], ['web']):
+    candidates = [
+        (f"scsearch1:{tr['full']}", None),
+        (f"ytsearch1:{tr['full']} audio", ['tv_embedded', 'android']),
+        (f"ytsearch1:{tr['full']}", ['ios', 'mweb']),
+    ]
+
+    for target, clients in candidates:
         for f in glob.glob(f"{base_name}.*"):
             try:
                 os.remove(f)
@@ -265,20 +247,21 @@ def download_audio_callback(call):
                 'noplaylist': True,
                 'geo_bypass': True,
                 'socket_timeout': 15,
-                'extractor_args': {'youtube': {'player_client': clients}},
             }
+            if clients:
+                opts['extractor_args'] = {'youtube': {'player_client': clients}}
+
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(yt_url, download=True)
-                if isinstance(info, dict) and info.get('uploader'):
-                    performer = info['uploader']
+                ydl.download([target])
+
             files = glob.glob(f"{base_name}.*")
             if files:
                 with open(files[0], 'rb') as audio:
                     bot.send_audio(
                         call.message.chat.id,
                         audio,
-                        title=title,
-                        performer=performer,
+                        title=tr["title"],
+                        performer=tr["artist"],
                         caption="🎵 @tezmedia_uz_bot orqali yuklandi"
                     )
                 bot.delete_message(call.message.chat.id, wait_msg.message_id)
@@ -287,32 +270,14 @@ def download_audio_callback(call):
         except Exception:
             pass
 
-    # 2-urinish: ochiq MP3 katalogidan fayl yuborish
-    if not sent:
-        j_artist, j_title = download_from_jamendo(title, jamendo_mp3)
-        if os.path.exists(jamendo_mp3):
-            try:
-                with open(jamendo_mp3, 'rb') as audio:
-                    bot.send_audio(
-                        call.message.chat.id,
-                        audio,
-                        title=j_title or title,
-                        performer=j_artist or "TezMedia",
-                        caption="🎵 @tezmedia_uz_bot orqali yuklandi"
-                    )
-                bot.delete_message(call.message.chat.id, wait_msg.message_id)
-                sent = True
-            except Exception:
-                pass
-
     if not sent:
         bot.edit_message_text(
-            "❌ Afsuski, Render serveri bu qo'shiq uchun audio faylni yuklab bera olmadi. Ro'yxatdan boshqa raqamni bosib ko'ring.",
+            "❌ Hozir bu audio faylni serverdan yuklab bo'lmadi. Ro'yxatdan boshqa raqamni bosib ko'ring.",
             call.message.chat.id,
             wait_msg.message_id
         )
 
-    for f in glob.glob(f"{base_name}*"):
+    for f in glob.glob(f"{base_name}.*"):
         try:
             os.remove(f)
         except Exception:
