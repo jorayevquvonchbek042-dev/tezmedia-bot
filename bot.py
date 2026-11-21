@@ -10,14 +10,12 @@ import telebot
 from telebot import types
 import yt_dlp
 
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 RAW_CHANNEL = os.environ.get("CHANNEL_ID", "").strip()
 if RAW_CHANNEL and not RAW_CHANNEL.startswith("@") and not RAW_CHANNEL.startswith("-100"):
     CHANNEL_ID = f"@{RAW_CHANNEL}"
 else:
     CHANNEL_ID = RAW_CHANNEL
-
-COOKIE_FILE = "cookies.txt" if os.path.exists("cookies.txt") else None
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=6)
 TRACK_ITEMS = {}
@@ -32,7 +30,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 def run_server():
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 7860))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
@@ -112,25 +110,6 @@ def search_tracks_fast(query):
 
     return found[:10]
 
-def build_ydl_opts(outtmpl, is_audio=True, clients=None):
-    opts = {
-        'format': 'bestaudio[filesize<45M]/bestaudio/best' if is_audio else 'best[ext=mp4][filesize<50M]/best[ext=mp4]/best',
-        'outtmpl': outtmpl,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'socket_timeout': 20,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        },
-    }
-    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
-        opts['cookiefile'] = COOKIE_FILE
-    if clients:
-        opts['extractor_args'] = {'youtube': {'player_client': clients}}
-    return opts
-
 @bot.callback_query_handler(func=lambda call: call.data == "check_sub")
 def check_sub_callback(call):
     if is_subscribed(call.from_user.id):
@@ -168,8 +147,18 @@ def download_video(message):
     wait_msg = bot.reply_to(message, "⏳ Video yuklanmoqda, biroz kuting...")
     filename = f"video_{message.chat.id}_{message.message_id}.mp4"
 
+    ydl_opts = {
+        'format': 'best[ext=mp4][filesize<50M]/best[ext=mp4]/best',
+        'outtmpl': filename,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'geo_bypass': True,
+        'socket_timeout': 20,
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
+    }
+
     try:
-        ydl_opts = build_ydl_opts(filename, is_audio=False, clients=['web', 'android', 'ios'])
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -229,30 +218,47 @@ def download_audio_callback(call):
         bot.answer_callback_query(call.id, "⚠️ Ro'yxat eskirgan, qayta qidiring.", show_alert=True)
         return
 
-    bot.answer_callback_query(call.id, "⏳ Audio yuklanmoqda...")
-    wait_msg = bot.send_message(call.message.chat.id, f"⏳ «{tr['full']}» yuklanmoqda...")
+    bot.answer_callback_query(call.id, "⏳ MP3 tayyorlanmoqda...")
+    wait_msg = bot.send_message(call.message.chat.id, f"⏳ «{tr['full']}» MP3 qilib yuklanmoqda...")
 
     base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{key.replace(':', '_')}"
     sent = False
 
     candidates = [
-        (f"ytsearch1:{tr['full']} audio", ['web', 'mweb']),
-        (f"ytsearch1:{tr['full']}", ['android', 'ios']),
+        (f"ytsearch1:{tr['full']} audio", ['android', 'ios']),
         (f"scsearch1:{tr['full']}", None),
+        (f"ytsearch1:{tr['full']}", ['web', 'mweb']),
     ]
 
     for target, clients in candidates:
-        for f in glob.glob(f"{base_name}.*"):
+        for f in glob.glob(f"{base_name}*"):
             try:
                 os.remove(f)
             except Exception:
                 pass
         try:
-            opts = build_ydl_opts(f"{base_name}.%(ext)s", is_audio=True, clients=clients)
+            opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': f"{base_name}.%(ext)s",
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'geo_bypass': True,
+                'socket_timeout': 20,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            }
+            if clients:
+                opts['extractor_args'] = {'youtube': {'player_client': clients}}
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([target])
 
-            files = glob.glob(f"{base_name}.*")
+            mp3_files = glob.glob(f"{base_name}*.mp3")
+            files = mp3_files or glob.glob(f"{base_name}*")
             if files:
                 with open(files[0], 'rb') as audio:
                     bot.send_audio(
@@ -270,12 +276,12 @@ def download_audio_callback(call):
 
     if not sent:
         bot.edit_message_text(
-            "❌ Hozir bu audio faylni serverdan yuklab bo'lmadi. Ro'yxatdan boshqa raqamni bosib ko'ring.",
+            "❌ Ushbu qo'shiq uchun MP3 fayl topilmadi. Ro'yxatdan boshqa raqamni bosib ko'ring.",
             call.message.chat.id,
             wait_msg.message_id
         )
 
-    for f in glob.glob(f"{base_name}.*"):
+    for f in glob.glob(f"{base_name}*"):
         try:
             os.remove(f)
         except Exception:
