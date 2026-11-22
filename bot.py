@@ -1,384 +1,217 @@
 import os
 import re
-import glob
-import json
-import base64
-import urllib.parse
-import urllib.request
+import time
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from flask import Flask
 import telebot
 from telebot import types
 import yt_dlp
 
-TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-RAW_CHANNEL = os.environ.get("CHANNEL_ID", "").strip()
-if RAW_CHANNEL and not RAW_CHANNEL.startswith("@") and not RAW_CHANNEL.startswith("-100"):
-    CHANNEL_ID = f"@{RAW_CHANNEL}"
-else:
-    CHANNEL_ID = RAW_CHANNEL
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@tezmedia_rasmiy")
 
-COOKIES_RAW = os.environ.get("YT_COOKIES", "").strip()
-COOKIES_PATH = "/tmp/yt_cookies.txt"
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
 
-def prepare_cookies_file():
-    if not COOKIES_RAW or COOKIES_RAW.lower() == "cookies.txt":
-        return None
-    try:
-        if "# Netscape HTTP Cookie File" in COOKIES_RAW or "\t" in COOKIES_RAW:
-            content = COOKIES_RAW
-        else:
-            content = base64.b64decode(COOKIES_RAW).decode("utf-8", errors="ignore")
-        if len(content.strip()) < 20:
-            return None
-        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
-            f.write(content)
-        return COOKIES_PATH
-    except Exception:
-        return None
 
-ACTIVE_COOKIE_FILE = prepare_cookies_file()
+@app.route("/")
+def home():
+    return "TezMedia Bot is running!"
 
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=6)
-TRACK_ITEMS = {}
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"TezMedia bot ishlamoqda!")
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-    def log_message(self, format, *args):
-        pass
-
-def run_server():
-    port = int(os.environ.get("PORT", 7860))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
-
-def extract_url(text):
-    if not text:
-        return None
-    match = re.search(r'https?://[^\s]+', text)
-    return match.group(0) if match else None
 
 def is_subscribed(user_id):
     if not CHANNEL_ID:
         return True
     try:
-        member = bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ['member', 'administrator', 'creator']
+        status = bot.get_chat_member(CHANNEL_ID, user_id).status
+        return status in ["member", "administrator", "creator"]
     except Exception:
-        return False
+        return True
 
-def send_sub_prompt(chat_id):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    channel_url = f"https://t.me/{CHANNEL_ID.lstrip('@')}"
-    btn_sub = types.InlineKeyboardButton("📢 Kanalga obuna bo'lish", url=channel_url)
-    btn_check = types.InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")
-    markup.add(btn_sub, btn_check)
-    bot.send_message(
-        chat_id,
-        "⚠️ Botdan foydalanish uchun avval rasmiy kanalimizga obuna bo'ling va «Tekshirish» tugmasini bosing:",
-        reply_markup=markup
-    )
 
-def fmt_sec(sec):
-    if not sec:
-        return ""
-    sec = int(sec)
-    m, s = divmod(sec, 60)
-    return f" {m}:{s:02d}"
+def download_youtube_song(query):
+    os.makedirs("downloads", exist_ok=True)
+    timestamp = int(time.time())
 
-def fetch_json(url, timeout=8):
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+    # 1. YouTube'dan 7 ta natija qidirib, Shorts va 60 soniyadan qisqa treklarni tashlab ketamiz
+    search_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "default_search": "ytsearch7",
+        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+    }
 
-def search_tracks_fast(query):
-    found = []
-    q_enc = urllib.parse.quote(query)
+    selected_url = None
+    song_title = query
 
-    try:
-        data = fetch_json(f"https://api.deezer.com/search?q={q_enc}&limit=10")
-        for item in data.get("data", []):
-            artist = (item.get("artist") or {}).get("name", "").strip()
-            title = (item.get("title") or "").strip()
-            preview = (item.get("preview") or "").strip()
-            dur = fmt_sec(item.get("duration"))
-            if title:
-                full = f"{artist} - {title}" if artist else title
-                found.append({
-                    "artist": artist or "TezMedia",
-                    "title": title,
-                    "full": full,
-                    "dur": dur,
-                    "preview": preview
-                })
-    except Exception:
-        pass
+    with yt_dlp.YoutubeDL(search_opts) as ydl:
+        info = ydl.extract_info(f"{query} official audio", download=False)
+        entries = info.get("entries") or []
 
-    try:
-        data = fetch_json(f"https://itunes.apple.com/search?term={q_enc}&media=music&limit=10")
-        seen = {x["full"].lower() for x in found}
-        for item in data.get("results", []):
-            artist = (item.get("artistName") or "").strip()
-            title = (item.get("trackName") or "").strip()
-            preview = (item.get("previewUrl") or "").strip()
-            dur_ms = item.get("trackTimeMillis")
-            dur = fmt_sec(dur_ms // 1000) if dur_ms else ""
-            if title:
-                full = f"{artist} - {title}" if artist else title
-                if full.lower() not in seen:
-                    seen.add(full.lower())
-                    found.append({
-                        "artist": artist or "TezMedia",
-                        "title": title,
-                        "full": full,
-                        "dur": dur,
-                        "preview": preview
-                    })
-    except Exception:
-        pass
+        for entry in entries:
+            if not entry:
+                continue
+            url = entry.get("url") or entry.get("webpage_url") or ""
+            duration = entry.get("duration") or 0
 
-    return found[:10]
+            # 30 soniyalik Shorts yoki qisqa parchalarni filtrlaymiz (kamida 60 soniya bo'lishi shart)
+            if "/shorts/" in url or duration < 60 or duration > 900:
+                continue
 
-@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
-def check_sub_callback(call):
-    if is_subscribed(call.from_user.id):
-        bot.answer_callback_query(call.id, "✅ Obuna tasdiqlandi!")
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
-        bot.send_message(
-            call.message.chat.id,
-            "Rahmat! Endi Instagram, TikTok, YouTube havolasini yuboring yoki qo'shiqchi nomini yozing."
-        )
-    else:
-        bot.answer_callback_query(call.id, "❌ Siz hali kanalga obuna bo'lmadingiz!", show_alert=True)
+            selected_url = (
+                url
+                if url.startswith("http")
+                else f"https://www.youtube.com/watch?v={entry.get('id')}"
+            )
+            song_title = entry.get("title") or query
+            break
 
-@bot.message_handler(commands=['start'])
+    if not selected_url:
+        return None, None
+
+    # 2. Tanlangan to'liq trekning audiosini yuklaymiz
+    out_template = f"downloads/song_{timestamp}.%(ext)s"
+    dl_opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": out_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+    }
+
+    with yt_dlp.YoutubeDL(dl_opts) as ydl:
+        dl_info = ydl.extract_info(selected_url, download=True)
+        file_path = ydl.prepare_filename(dl_info)
+        song_title = dl_info.get("title") or song_title
+        return file_path, song_title
+
+
+def download_video_link(url):
+    os.makedirs("downloads", exist_ok=True)
+    timestamp = int(time.time())
+    out_template = f"downloads/video_{timestamp}.%(ext)s"
+
+    ydl_opts = {
+        "format": "best[ext=mp4][filesize<48M]/best[ext=mp4]/best",
+        "outtmpl": out_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info), info.get("title", "Video")
+
+
+@bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
-    if not is_subscribed(message.from_user.id):
-        send_sub_prompt(message.chat.id)
-        return
-    bot.reply_to(
-        message,
-        "Assalomu alaykum! TezMedia botiga xush kelibsiz.\n\n"
-        "📥 Video yuklash uchun Instagram, TikTok yoki YouTube havolasini yuboring.\n"
-        "🎵 Qo'shiq topish uchun qo'shiqchi yoki qo'shiq nomini yozing!"
+    bot.send_message(
+        message.chat.id,
+        "👋 **TezMedia** botiga xush kelibsiz!\n\n"
+        "🎵 **Qo‘shiq topish:** Qo‘shiq yoki ijrochi nomini yozing.\n"
+        "📥 **Video yuklash:** Instagram, TikTok yoki YouTube havolasini yuboring.",
+        parse_mode="Markdown",
     )
 
-@bot.message_handler(func=lambda m: extract_url(m.text) is not None)
-def download_video(message):
-    if not is_subscribed(message.from_user.id):
-        send_sub_prompt(message.chat.id)
-        return
 
-    url = extract_url(message.text)
-    wait_msg = bot.reply_to(message, "⏳ Video yuklanmoqda, biroz kuting...")
-    base_vid = f"video_{message.chat.id}_{message.message_id}"
-    filename = f"{base_vid}.mp4"
-    sent = False
-
-    for clients in [['web', 'mweb', 'android'], ['ios', 'web']]:
-        for f in glob.glob(f"{base_vid}*"):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-
-        ydl_opts = {
-            'format': 'best[ext=mp4][filesize<50M]/best[ext=mp4]/best',
-            'outtmpl': filename,
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'geo_bypass': True,
-            'socket_timeout': 20,
-            'extractor_args': {'youtube': {'player_client': clients}},
-        }
-        if ACTIVE_COOKIE_FILE:
-            ydl_opts['cookiefile'] = ACTIVE_COOKIE_FILE
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-
-            ready_files = [
-                f for f in glob.glob(f"{base_vid}*")
-                if not f.endswith((".part", ".ytdl", ".temp"))
-            ]
-            if ready_files:
-                with open(ready_files[0], 'rb') as video:
-                    bot.send_video(message.chat.id, video, caption="📥 @tezmedia_uz_bot orqali yuklandi")
-                bot.delete_message(message.chat.id, wait_msg.message_id)
-                sent = True
-                break
-        except Exception:
-            pass
-
-    if not sent:
-        bot.edit_message_text(
-            "❌ Videoni yuklab bo'lmadi. Havola ochiq ekanligini tekshiring yoki keyinroq urinib ko'ring.",
+@bot.message_handler(func=lambda m: True)
+def handle_all(message):
+    user_id = message.from_user.id
+    if not is_subscribed(user_id):
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "📢 Kanalga obuna bo‘lish", url="https://t.me/tezmedia_rasmiy"
+            )
+        )
+        bot.send_message(
             message.chat.id,
-            wait_msg.message_id
+            "Botdan foydalanish uchun avval **Trend & Media** kanaliga obuna bo‘ling:",
+            reply_markup=markup,
+            parse_mode="Markdown",
         )
-
-    for f in glob.glob(f"{base_vid}*"):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
-
-@bot.message_handler(func=lambda m: m.text and not m.text.startswith('/') and extract_url(m.text) is None)
-def search_music(message):
-    if not is_subscribed(message.from_user.id):
-        send_sub_prompt(message.chat.id)
         return
 
-    query = message.text.strip()
-    tracks = search_tracks_fast(query)
-    if not tracks:
-        tracks = [{"artist": "TezMedia", "title": query, "full": query, "dur": "", "preview": ""}]
-
-    lines = [f"🔎 {query}\n"]
-    buttons = []
-
-    for idx, tr in enumerate(tracks, 1):
-        lines.append(f"{idx}. {tr['full']}{tr['dur']}")
-        key = f"{message.chat.id}_{message.message_id}_{idx}"
-        TRACK_ITEMS[key] = tr
-        if len(TRACK_ITEMS) > 1500:
-            TRACK_ITEMS.pop(next(iter(TRACK_ITEMS)))
-        buttons.append(types.InlineKeyboardButton(str(idx), callback_data=f"dl:{key}"))
-
-    markup = types.InlineKeyboardMarkup(row_width=5)
-    markup.add(*buttons)
-
-    bot.reply_to(message, "\n".join(lines), reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("dl:"))
-def download_audio_callback(call):
-    if not is_subscribed(call.from_user.id):
-        bot.answer_callback_query(call.id, "⚠️ Avval kanalga obuna bo'ling!", show_alert=True)
-        send_sub_prompt(call.message.chat.id)
+    text = (message.text or "").strip()
+    if not text:
         return
 
-    key = call.data.split("dl:", 1)[1]
-    tr = TRACK_ITEMS.get(key)
-    if not tr:
-        bot.answer_callback_query(call.id, "⚠️ Ro'yxat eskirgan, qayta qidiring.", show_alert=True)
-        return
-
-    bot.answer_callback_query(call.id, "⏳ Audio tayyorlanmoqda...")
-    wait_msg = bot.send_message(call.message.chat.id, f"⏳ «{tr['full']}» yuklanmoqda...")
-
-    base_name = f"audio_{call.message.chat.id}_{call.message.message_id}_{key.replace(':', '_')}"
-    sent = False
-    clean_full = re.sub(r'\s*\(.*?\)\s*', ' ', tr['full']).strip()
-
-    full_candidates = [
-        (f"scsearch2:{clean_full}", None),
-        (f"ytsearch1:{clean_full} official audio", ['web', 'mweb', 'android']),
-        (f"ytsearch1:{clean_full}", ['ios', 'web']),
-    ]
-
-    for target, clients in full_candidates:
-        for f in glob.glob(f"{base_name}*"):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
+    # Agar havola yuborilgan bo'lsa — videoni yuklaymiz
+    if re.match(r"^https?://", text):
+        wait_msg = bot.send_message(message.chat.id, "⏳ Video yuklanmoqda...")
+        file_path = None
         try:
-            opts = {
-                'format': 'bestaudio[ext!=m3u8]/bestaudio/best',
-                'outtmpl': f"{base_name}.%(ext)s",
-                'quiet': True,
-                'no_warnings': True,
-                'noplaylist': True,
-                'geo_bypass': True,
-                'socket_timeout': 20,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-            }
-            if clients:
-                opts['extractor_args'] = {'youtube': {'player_client': clients}}
-            if ACTIVE_COOKIE_FILE:
-                opts['cookiefile'] = ACTIVE_COOKIE_FILE
+            file_path, title = download_video_link(text)
+            if not file_path or not os.path.exists(file_path):
+                bot.edit_message_text(
+                    "❌ Videoni yuklab bo‘lmadi. Havolani tekshirib qayta yuboring.",
+                    message.chat.id,
+                    wait_msg.message_id,
+                )
+                return
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([target])
+            with open(file_path, "rb") as video_file:
+                bot.send_video(
+                    message.chat.id,
+                    video_file,
+                    caption=f"🎬 {title}\n\n📥 @tezmedia_uz_bot",
+                )
+            bot.delete_message(message.chat.id, wait_msg.message_id)
+        except Exception as e:
+            bot.edit_message_text(
+                f"⚠️ Xatolik: {str(e)[:120]}",
+                message.chat.id,
+                wait_msg.message_id,
+            )
+        finally:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
 
-            mp3_files = glob.glob(f"{base_name}*.mp3")
-            files = mp3_files or [
-                f for f in glob.glob(f"{base_name}*")
-                if not f.endswith((".part", ".ytdl", ".temp"))
-            ]
-            if files and os.path.getsize(files[0]) > 50000:
-                with open(files[0], 'rb') as audio:
-                    bot.send_audio(
-                        call.message.chat.id,
-                        audio,
-                        title=tr["title"],
-                        performer=tr["artist"],
-                        caption="🎵 @tezmedia_uz_bot orqali yuklandi"
-                    )
-                bot.delete_message(call.message.chat.id, wait_msg.message_id)
-                sent = True
-                break
-        except Exception:
-            pass
-
-    preview_url = tr.get("preview")
-    if not sent and preview_url:
-        for f in glob.glob(f"{base_name}*"):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-        try:
-            ext = ".m4a" if ".m4a" in preview_url else ".mp3"
-            raw_path = f"{base_name}{ext}"
-            req = urllib.request.Request(preview_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp, open(raw_path, "wb") as out:
-                out.write(resp.read())
-
-            if os.path.exists(raw_path) and os.path.getsize(raw_path) > 1000:
-                with open(raw_path, "rb") as audio:
-                    bot.send_audio(
-                        call.message.chat.id,
-                        audio,
-                        title=tr["title"],
-                        performer=tr["artist"],
-                        caption="🎵 @tezmedia_uz_bot (30s preview — to'liq manba cheklangan)"
-                    )
-                bot.delete_message(call.message.chat.id, wait_msg.message_id)
-                sent = True
-        except Exception:
-            pass
-
-    if not sent:
-        bot.edit_message_text(
-            "❌ Ushbu qo'shiq uchun audio topilmadi. Ro'yxatdan boshqa raqamni bosing.",
-            call.message.chat.id,
-            wait_msg.message_id
+    # Aks holda — YouTube'dan to'liq qo'shiq qidiramiz
+    else:
+        wait_msg = bot.send_message(
+            message.chat.id, "🔎 YouTube’dan to‘liq qo‘shiq qidirilmoqda..."
         )
-
-    for f in glob.glob(f"{base_name}*"):
+        file_path = None
         try:
-            os.remove(f)
-        except Exception:
-            pass
+            file_path, title = download_youtube_song(text)
+            if not file_path or not os.path.exists(file_path):
+                bot.edit_message_text(
+                    "❌ To‘liq qo‘shiq topilmadi. Qo‘shiq nomini aniqroq yozib ko‘ring.",
+                    message.chat.id,
+                    wait_msg.message_id,
+                )
+                return
+
+            with open(file_path, "rb") as audio_file:
+                bot.send_audio(
+                    message.chat.id,
+                    audio_file,
+                    title=title,
+                    performer="TezMedia",
+                    caption="📥 @tezmedia_uz_bot orqali yuklandi",
+                )
+            bot.delete_message(message.chat.id, wait_msg.message_id)
+        except Exception as e:
+            bot.edit_message_text(
+                f"⚠️ Xatolik: {str(e)[:120]}",
+                message.chat.id,
+                wait_msg.message_id,
+            )
+        finally:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+
 
 if __name__ == "__main__":
-    threading.Thread(target=run_server, daemon=True).start()
-    bot.infinity_polling(timeout=20, long_polling_timeout=15)
-       
+    threading.Thread(target=run_web, daemon=True).start()
+    bot.infinity_polling(skip_pending=True)
