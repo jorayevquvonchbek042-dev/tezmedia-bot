@@ -54,7 +54,7 @@ def download_youtube_song(query):
         "quiet": True,
         "no_warnings": True,
         "extract_flat": True,
-        "default_search": "ytsearch7",
+        "default_search": "ytsearch3",
         "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
     }
 
